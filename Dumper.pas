@@ -52,6 +52,7 @@ type
     function GetLocalProcAddr(hModule: HMODULE; ProcName: PAnsiChar): Pointer;
     function TargetHasModule(const Name: string): Boolean;
     function RPM(Address: NativeUInt; Buf: Pointer; BufSize: NativeUInt): Boolean;
+    procedure MakeMemoryReadable(Base, Size: NativeUInt);
   public
     constructor Create(const AProcess: TProcessInformation; AImageBase, AOEP: UIntPtr);
     destructor Destroy; override;
@@ -229,8 +230,9 @@ begin
   try
     Size := PE.DumpSize;
     GetMem(Buf, Size);
+    MakeMemoryReadable(FImageBase, Size);
     if not RPM(FImageBase, Buf, Size) then
-      raise Exception.Create('DumpToFile RPM failed');
+      raise Exception.CreateFmt('DumpToFile RPM failed (base: %X, size: %X)', [FImageBase, Size]);
 
     IATRawOffset := FIAT - FImageBase;
     // TrimHugeSections may adjust IATRawOffset depending on what is trimmed.
@@ -577,6 +579,31 @@ begin
   Result := ReadProcessMemory(FProcess.hProcess, Pointer(Address), Buf, BufSize, BufSize);
   if not Result then
     Log(ltFatal, 'RPM failed');
+end;
+
+procedure TDumper.MakeMemoryReadable(Base, Size: NativeUInt);
+var
+  mbi: MEMORY_BASIC_INFORMATION;
+  Addr: NativeUInt;
+  EndAddr: NativeUInt;
+  BytesReturned: SIZE_T;
+  OldProtect: DWORD;
+begin
+  Addr := Base;
+  EndAddr := Addr + Size;
+
+  while Addr < EndAddr do
+  begin
+    BytesReturned := VirtualQueryEx(FProcess.hProcess, Pointer(Addr), mbi, SizeOf(mbi));
+
+    if BytesReturned = 0 then
+      Break;
+
+    if (mbi.State = MEM_COMMIT) and (mbi.Protect = PAGE_NOACCESS) then
+      VirtualProtectEx(FProcess.hProcess, mbi.BaseAddress, mbi.RegionSize, PAGE_READONLY, @OldProtect);
+
+    Addr := NativeUInt(mbi.BaseAddress) + mbi.RegionSize;
+  end;
 end;
 
 { TDumperDotnet }
