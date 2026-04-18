@@ -142,7 +142,7 @@ var
 
       if (PByte(Dis.EIP)^ = $E8) and not IgnoreMethodBoundary then // call
       begin
-        if Dis.Instruction.AddrValue > TextBase + CodeSize then
+        if (Dis.Instruction.AddrValue < TextBase) or (Dis.Instruction.AddrValue > TextBase + CodeSize) then
           Exit(0); // 32-bit: Probably direct API call. Handled below via FGuardAddrs.
 
         Result := FindCallOrJmpPtr(Dis.Instruction.AddrValue);

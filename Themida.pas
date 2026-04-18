@@ -205,7 +205,7 @@ begin
     if Buf shr 31 <> 0 then // Kernel address, can't be right
       WaitForSingleObject(Self.Handle, INFINITE);
 
-    if Buf < FImageBoundary then
+    if (Buf > FImageBase) and (Buf < FImageBoundary) then
     begin
       Inc(AllocMemCounter);
       if AllocMemCounter = IfThen(FCompressed, 4, 5) then
@@ -1179,7 +1179,7 @@ var
   SiteSet: TList<NativeUInt>;
   Site: array[0..5] of Byte;
   IsJmp: Boolean;
-  IATData: array[0..2047] of NativeUInt;
+  IATData: array[0..(MAX_IAT_SIZE div SizeOf(Pointer)) - 1] of NativeUInt;
   IATMap: TDictionary<NativeUInt, NativeUInt>;
 begin
   SiteSet := TList<NativeUInt>.Create;
