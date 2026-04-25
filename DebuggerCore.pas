@@ -92,7 +92,7 @@ type
 
 implementation
 
-uses PEInfo;
+uses PEInfo, Dumper;
 
 { TDebuggerCore }
 
@@ -626,6 +626,8 @@ begin
       NT.OptionalHeader.AddressOfEntryPoint := NewEP;
       FS.Seek(PosOptionalHeader + Cardinal(@TImageOptionalHeader(nil^).AddressOfEntryPoint), soBeginning);
       FS.Write(NT.OptionalHeader.AddressOfEntryPoint, SizeOf(NT.OptionalHeader.AddressOfEntryPoint));
+
+      TDumper.SwitchSxSManifestType(FS, PE, 2, 1);
     finally
       PE.Free;
     end;

@@ -78,6 +78,8 @@ type
     function DetermineIATSize(IAT: PByte): UInt32;
     function IsAPIAddress(Address: NativeUInt): Boolean;
 
+    class procedure SwitchSxSManifestType(S: TStream; PE: TPEHeader; SwitchFrom, SwitchTo: Integer);
+
     property IAT: NativeUInt read FIAT write FIAT; // Virtual address of IAT in target
   end;
 
@@ -202,6 +204,8 @@ begin
     if IsDLL then
     begin
       PE.NTHeaders.FileHeader.Characteristics := PE.NTHeaders.FileHeader.Characteristics or IMAGE_FILE_DLL;
+
+      SwitchSxSManifestType(FS, PE, 1, 2); // Switch back
     end;
 
     if (PE.NTHeaders.OptionalHeader.DllCharacteristics and $40) <> 0 then
@@ -757,6 +761,59 @@ begin
       VirtualProtectEx(FProcess.hProcess, mbi.BaseAddress, mbi.RegionSize, PAGE_READONLY, @OldProtect);
 
     Addr := NativeUInt(mbi.BaseAddress) + mbi.RegionSize;
+  end;
+end;
+
+class procedure TDumper.SwitchSxSManifestType(S: TStream; PE: TPEHeader; SwitchFrom, SwitchTo: Integer);
+var
+  Rsrc: PPESection;
+  RsrcSize, Offset, i, ManifestSubDir, IDOffset: DWORD;
+  RsrcData: PByte;
+  NumNamed, NumID: Word;
+begin
+  // This function changes the manifest type between EXE/DLL so side-by-side functionality (like pinned MSVC versions) works properly.
+  if PE.NTHeaders.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_RESOURCE].VirtualAddress = 0 then
+    Exit;
+
+  Rsrc := PE.GetSectionByVA(PE.NTHeaders.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_RESOURCE].VirtualAddress);
+  RsrcSize := PE.NTHeaders.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_RESOURCE].Size;
+  S.Seek(Rsrc.Header.PointerToRawData, soBeginning);
+  GetMem(RsrcData, RsrcSize);
+  try
+    S.Read(RsrcData^, RsrcSize);
+
+    NumNamed := PWord(RsrcData + $C)^;
+    NumID := PWord(RsrcData + $E)^;
+    if NumID = 0 then
+      Exit;
+
+    Offset := $10 + NumNamed * 8;
+    ManifestSubDir := 0;
+    for i := 0 to NumID - 1 do
+      if PInteger(RsrcData + Offset + i * 8)^ = 24 then // MANIFEST
+      begin
+        ManifestSubDir := PCardinal(RsrcData + Offset + i * 8 + 4)^;
+        Break;
+      end;
+
+    if (ManifestSubDir = 0) or (ManifestSubDir shr 31 <> 1) then
+      Exit;
+
+    ManifestSubDir := ManifestSubDir and $7FFFFFFF;
+    if (PWord(RsrcData + ManifestSubDir + $C)^ <> 0) or (PWord(RsrcData + ManifestSubDir + $E)^ <> 1) then
+    begin
+      Log(ltInfo, 'Encountered weird manifest resource dir');
+      Exit;
+    end;
+
+    IDOffset := ManifestSubDir + $10;
+    if PInteger(RsrcData + IDOffset)^ <> SwitchFrom then
+      Exit;
+
+    S.Seek(Rsrc.Header.PointerToRawData + IDOffset, soBeginning);
+    S.Write(SwitchTo, 4);
+  finally
+    FreeMem(RsrcData);
   end;
 end;
 
