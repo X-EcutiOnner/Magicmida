@@ -48,6 +48,7 @@ type
   end;
 
   {$IFDEF FPC}
+  TImageExportDirectory = TIMAGE_EXPORT_DIRECTORY;
   PImageExportDirectory = PIMAGE_EXPORT_DIRECTORY;
   PImageImportDescriptor = PIMAGE_IMPORT_DESCRIPTOR;
   TImageImportDescriptor = IMAGE_IMPORT_DESCRIPTOR;

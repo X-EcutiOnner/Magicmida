@@ -11,14 +11,29 @@ const
 type
   TExportTable = TDictionary<Pointer, string>;
 
+  TForward = record
+    Key: string;
+    Value: Pointer;
+
+    constructor Create(const AKey: string; AValue: Pointer);
+  end;
+
   TRemoteModule = record
     Base, EndOff: PByte;
     Name: string;
     ExportTbl: TExportTable;
+    Forwards: TList<TForward>;
   end;
   PRemoteModule = ^TRemoteModule;
 
-  TForwardDict = TDictionary<Pointer, Pointer>;
+  TForwardOrigin = record
+    SourceModule: PRemoteModule;
+    SourceAddress: Pointer;  // address in source module's export table
+
+    constructor Create(ASourceModule: PRemoteModule; ASourceAddress: Pointer);
+  end;
+
+  TForwardMap = TObjectDictionary<Pointer, TList<TForwardOrigin>>;
 
   TImportThunk = class
   public
@@ -34,23 +49,23 @@ type
   private
     FProcess: TProcessInformation;
     FOEP, FIAT, FImageBase: NativeUInt;
-    FForwards: TForwardDict;
-    FForwardsType2: TForwardDict; // Key: NTDLL, Value: user32 (points to fwd-string)
-    FForwardsKernelbase: TForwardDict; // Key: NTDLL, Value: kernelbase
-    FForwardsWsock: TForwardDict;
+    FForwards: TForwardMap;
     FAllModules: TList<PRemoteModule>;
     FIATImage: PByte;
     FIATImageSize: Cardinal;
 
+    {$IFDEF CPUX86}
     FUsrPath: string;
     FHUsr: HMODULE;
 
-    procedure CollectNTFwd; overload;
-    procedure CollectForwards(Fwds: TForwardDict; hModReal, hModScan: HMODULE); overload;
+    procedure CollectSpecialUser32Forwards(User32RM: PRemoteModule);
+    {$ENDIF}
+
     procedure GatherModuleExportsFromRemoteProcess(M: PRemoteModule);
+    procedure ResolveForwards(M: PRemoteModule);
     procedure TakeModuleSnapshot;
-    function GetLocalProcAddr(hModule: HMODULE; ProcName: PAnsiChar): Pointer;
-    function TargetHasModule(const Name: string): Boolean;
+    function GetRemoteModule(const Name: string): PRemoteModule; overload;
+    function GetRemoteModule(Base: HMODULE): PRemoteModule; overload;
     function RPM(Address: NativeUInt; Buf: Pointer; BufSize: NativeUInt): Boolean;
     procedure MakeMemoryReadable(Base, Size: NativeUInt);
   public
@@ -78,6 +93,29 @@ type
 
 implementation
 
+const
+  ForwardPreferences: array[0..8] of string = (
+    'kernel32.dll', // prioritize over kernelbase/ntdll
+    'ole32.dll',    // prioritize over combase
+    'advapi32.dll', // prioritize over cryptbase
+    'netapi32.dll', // prioritize over netutils
+    'comdlg32.dll', // prioritize over shlwapi
+    'crypt32.dll',  // prioritize over dpapi
+    'gdi32.dll',    // prioritize over gdi32full
+    'dbghelp.dll',  // prioritize over dbgcore
+    'setupapi.dll'  // prioritize over cfgmgr32
+  );
+
+function PreferenceScore(const Name: string): Integer;
+var
+  i: Integer;
+begin
+  Result := 0;
+  for i := Low(ForwardPreferences) to High(ForwardPreferences) do
+    if SameText(Name, ForwardPreferences[i]) then
+      Inc(Result);
+end;
+
 { TDumper }
 
 constructor TDumper.Create(const AProcess: TProcessInformation; AImageBase, AOEP: UIntPtr);
@@ -86,18 +124,17 @@ begin
   FOEP := AOEP;
   FImageBase := AImageBase;
 
+  {$IFDEF CPUX86}
   if Win32MajorVersion > 5 then
   begin
+    // user32 has an internal function 'PatchExportTableForwarders' that patches the AddressOfFunctions table.
     FUsrPath := ExtractFilePath(ParamStr(0)) + 'mmusr32.dll';
     CopyFile('C:\Windows\system32\user32.dll', PChar(FUsrPath), False);
     FHUsr := LoadLibraryEx(PChar(FUsrPath), 0, $20) - 2;
   end;
+  {$ENDIF}
 
-  FForwards := TForwardDict.Create(256);
-  FForwardsType2 := TForwardDict.Create(16);
-  FForwardsKernelbase := TForwardDict.Create(32);
-  FForwardsWsock := TForwardDict.Create(16);
-  CollectNTFwd;
+  FForwards := TForwardMap.Create([doOwnsValues], 512);
 end;
 
 destructor TDumper.Destroy;
@@ -105,15 +142,13 @@ var
   RM: PRemoteModule;
 begin
   FForwards.Free;
-  FForwardsType2.Free;
-  FForwardsKernelbase.Free;
-  FForwardsWsock.Free;
 
   if FAllModules <> nil then
   begin
     for RM in FAllModules do
     begin
       RM.ExportTbl.Free;
+      RM.Forwards.Free;
       Dispose(RM);
     end;
     FAllModules.Free;
@@ -122,102 +157,18 @@ begin
   if FIATImage <> nil then
     FreeMem(FIATImage);
 
+  {$IFDEF CPUX86}
   if FHUsr <> 0 then
   begin
     FreeLibrary(FHUsr + 2);
     Windows.DeleteFile(PChar(FUsrPath));
   end;
+  {$ENDIF}
 
   inherited;
 end;
 
-procedure TDumper.CollectNTFwd;
-var
-  hMain, hSecondary, hTertiary: HMODULE;
-begin
-  CollectForwards(FForwards, GetModuleHandle(kernel32), 0); // fwd to ntdll
-  if FHUsr <> 0 then
-    CollectForwards(FForwardsType2, GetModuleHandle(user32), FHUsr);
-  CollectForwards(FForwards, GetModuleHandle('ole32.dll'), 0); // fwd to combase
-  CollectForwards(FForwards, GetModuleHandle('advapi32.dll'), 0); // fwd to cryptbase
-
-  hMain := LoadLibrary('netapi32.dll'); // fwd to netutils
-  hSecondary := LoadLibrary('srvcli.dll'); // Required for CollectForwards
-  hTertiary := LoadLibrary('samcli.dll'); // Required for CollectForwards
-  CollectForwards(FForwards, hMain, 0);
-  FreeLibrary(hTertiary);
-  FreeLibrary(hSecondary);
-  FreeLibrary(hMain);
-
-  if Win32MajorVersion >= 6 then
-  begin
-    hMain := LoadLibrary('crypt32.dll'); // fwd to dpapi
-    hSecondary := LoadLibrary('dpapi.dll'); // Required for CollectForwards
-    CollectForwards(FForwards, hMain, 0);
-    FreeLibrary(hMain);
-    FreeLibrary(hSecondary);
-  end;
-
-  hMain := LoadLibrary('dbghelp.dll'); // fwd to dbgcore
-  hSecondary := LoadLibrary('dbgcore.dll'); // Required for CollectForwards
-  CollectForwards(FForwards, hMain, 0);
-  FreeLibrary(hMain);
-  FreeLibrary(hSecondary);
-
-  hMain := LoadLibrary('setupapi.dll'); // fwd to cfgmgr32
-  hSecondary := LoadLibrary('cfgmgr32.dll'); // Required for CollectForwards
-  CollectForwards(FForwards, hMain, 0);
-  FreeLibrary(hMain);
-  FreeLibrary(hSecondary);
-
-  hMain := LoadLibrary('wsock32.dll'); // fwd to ws2_32
-  hSecondary := LoadLibrary('ws2_32.dll');
-  CollectForwards(FForwardsWsock, hMain, 0);
-  FreeLibrary(hMain);
-  FreeLibrary(hSecondary);
-
-  // This is separate because most are covered by kernel32
-  if GetModuleHandle('kernelbase.dll') <> 0 then
-    CollectForwards(FForwardsKernelbase, GetModuleHandle('kernelbase.dll'), 0); // fwd to ntdll
-end;
-
-procedure TDumper.CollectForwards(Fwds: TForwardDict; hModReal, hModScan: HMODULE);
-var
-  ModScan: PByte;
-  ExpDir: PImageExportDirectory;
-  i, DotPos: Integer;
-  a: PCardinal;
-  Fwd: PAnsiChar;
-  hMod: HMODULE;
-  ProcAddr: Pointer;
-begin
-  if hModScan = 0 then
-    hModScan := hModReal;
-  ModScan := Pointer(hModScan);
-  ExpDir := Pointer(ModScan + PImageNTHeaders(ModScan + PImageDosHeader(ModScan)._lfanew).OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
-
-  a := PCardinal(ModScan + ExpDir.AddressOfFunctions);
-  for i := 0 to ExpDir.NumberOfFunctions - 1 do
-  begin
-    Fwd := PAnsiChar(ModScan + a^); // e.g. NTDLL.RtlAllocateHeap
-    DotPos := Pos(AnsiString('.'), Fwd);
-    if (Length(Fwd) in [10..90]) and (((DotPos > 0) and (DotPos < 15)) or (Pos(AnsiString('api-ms-win'), Fwd) > 0)) and (Pos(AnsiString('.#'), Fwd) = 0) then
-    begin
-      hMod := GetModuleHandleA(PAnsiChar(Copy(Fwd, 1, DotPos - 1)));
-      if hMod > 0 then
-      begin
-        // Not using the normal GetProcAddress because it can return apphelp hooks (e.g., CoCreateInstance when running as admin)
-        ProcAddr := GetLocalProcAddr(hMod, PAnsiChar(Copy(Fwd, DotPos + 1, 50)));
-        if ProcAddr <> nil then
-          Fwds.AddOrSetValue(ProcAddr, PByte(hModReal) + a^);
-        //Log(ltInfo, Format('%s @ %p', [PAnsiChar(Copy(Fwd, DotPos + 1, 50)), ProcAddr]));
-      end
-      //else
-      //  Log(ltFatal, Format('Forward target not loaded: %s', [string(AnsiString(PAnsiChar(Copy(Fwd, 1, DotPos - 1))))]));
-    end;
-    Inc(a);
-  end;
-end;
+{$POINTERMATH ON}
 
 procedure TDumper.DumpToFile(const FileName: string; PE: TPEHeader; IsDLL: Boolean = False);
 var
@@ -268,8 +219,6 @@ begin
   end;
 end;
 
-{$POINTERMATH ON}
-
 function TDumper.DetermineIATSize(IAT: PByte): UInt32;
 var
   LastValidOffset, i: UInt32;
@@ -287,23 +236,49 @@ begin
   Result := LastValidOffset + SizeOf(Pointer);
 end;
 
+type
+  TResolutionCandidate = record
+    Address: Pointer;      // The pointer to use for export lookup
+    Module: PRemoteModule;
+  end;
+
+  TIATSlot = record
+    Candidates: TList<TResolutionCandidate>; // All valid resolutions
+    ChosenCandidate: Integer;                // Index into Candidates (-1 = unresolved)
+    IsZero: Boolean;
+  end;
+
 function TDumper.Process: TPEHeader;
 var
   IAT: PByte;
-  i, j: Integer;
+  i, j, k: Integer;
   IATSize, Diff: Cardinal;
   PE: TPEHeader;
   a: ^PByte;
   Fwd: Pointer;
   Thunks: TList<TImportThunk>;
   Thunk: TImportThunk;
-  NeedNewThunk, Found: Boolean;
+  Found: Boolean;
   RM: PRemoteModule;
   s: AnsiString;
   OrdIndex: Cardinal;
-  Section, Strs, RangeChecker: PByte;
+  Section, Strs: PByte;
   Descriptors: PImageImportDescriptor;
   ImportSect: PPESection;
+
+  // --- Pass 1 data ---
+  Slots: array of TIATSlot;
+  Cand: TResolutionCandidate;
+  SlotCount: Integer;
+  Origins: TList<TForwardOrigin>;
+  Origin: TForwardOrigin;
+
+  // --- Pass 2 data ---
+  GroupStart, GroupEnd: Integer;
+  ModuleVotes: TDictionary<string, Integer>;
+  ModuleName, WinnerName: string;
+  WinnerVotes: Integer;
+  WinnerRM: PRemoteModule;
 begin
   if FIAT = 0 then
     raise Exception.Create('Must set IAT before calling Process()');
@@ -330,60 +305,152 @@ begin
   if FAllModules = nil then
     TakeModuleSnapshot;
 
-  Thunks := TObjectList<TImportThunk>.Create;
+  SlotCount := IATSize div SizeOf(Pointer);
+  SetLength(Slots, SlotCount);
+
+  // =========================================================
+  // PASS 1: Collect all candidates for every IAT slot
+  // =========================================================
   a := Pointer(IAT);
-  NeedNewThunk := False; // whether there's an address "gap" (example: k32-api, 0, k32-api)
-  for i := 0 to IATSize div SizeOf(Pointer) - 1 do
+  for i := 0 to SlotCount - 1 do
   begin
-    //Log(ltInfo, IntToHex(UIntPtr(a) - UIntPtr(IAT) + FIAT, 8) + ' -> ' + IntToHex(UIntPtr(a^), 8));
-    // Type 2: a^ is correct for export lookup, but need to look in different module! (ntdll --> user32)
-    if FForwardsType2.TryGetValue(a^, Fwd) then
+    Slots[i].ChosenCandidate := -1;
+    Slots[i].Candidates := TList<TResolutionCandidate>.Create;
+    Slots[i].IsZero := a^ = nil;
+
+    if Slots[i].IsZero then
     begin
-      {$IFDEF CPUX64}a^ := Fwd;{$ENDIF}
-      RangeChecker := Fwd;
-    end
-    else
-    begin
-      if FForwards.TryGetValue(a^, Fwd) then
-        a^ := Fwd
-      else if FForwardsKernelbase.TryGetValue(a^, Fwd) then
-        a^ := Fwd
-      else if FForwardsWsock.TryGetValue(a^, Fwd) and TargetHasModule('wsock32.dll') then
-        a^ := Fwd;
-      RangeChecker := a^;
+      Inc(a);
+      Continue;
     end;
-    //Log(ltInfo, ' -> ' + IntToHex(UIntPtr(a^), 8));
 
-    Found := False;
+    // --- Variant A: no forwarding ---
+    Cand.Address := a^;
+    Cand.Module := nil;
     for RM in FAllModules do
-      if (RangeChecker > RM.Base) and (RangeChecker < RM.EndOff) then
+      if (PByte(Cand.Address) > RM.Base) and (PByte(Cand.Address) < RM.EndOff) then
       begin
-        if RM.ExportTbl = nil then
-          GatherModuleExportsFromRemoteProcess(RM);
-
-        if RM.ExportTbl.ContainsKey(a^) then
+        if RM.ExportTbl.ContainsKey(Cand.Address) then
         begin
-          if (Thunks.Count = 0) or (Thunks.Last.Name <> RM.Name) or NeedNewThunk then
-          begin
-            Thunks.Add(TImportThunk.Create(RM));
-            NeedNewThunk := False; // reset
-          end;
-
-          Found := True;
-          //Log(ltInfo, 'IAT ' + IntToHex(UIntPtr(a) - UIntPtr(IAT) + FIAT, 8) + ' -> API ' + IntToHex(UIntPtr(a^), 8) + ' belongs to ' + RM.Name);
-          Thunks.Last.Addresses.Add(PPointer(a))
-        end
-        else
-          Log(ltFatal, 'IAT ' + IntToHex(UIntPtr(a) - UIntPtr(IAT) + FIAT, 8) + ' -> API ' + IntToHex(UIntPtr(a^), 8) + ' not in export table of ' + RM.Name + ' (likely a bogus entry)');
-
-        Break;
+          Cand.Module := RM;
+          Slots[i].Candidates.Add(Cand);
+        end;
+        Break; // only one module owns this address
       end;
 
-    if not Found then
-      NeedNewThunk := True;
+    // --- Variant B: FForwards (e.g. ntdll stub -> kernelbase real) ---
+    if FForwards.TryGetValue(a^, Origins) then
+      for Origin in Origins do
+      begin
+        Cand.Address := Origin.SourceAddress;
+        Cand.Module := Origin.SourceModule;
+        Slots[i].Candidates.Add(Cand);
+      end;
+
+    if Slots[i].Candidates.Count = 0 then
+      Log(ltInfo, 'IAT slot ' + IntToHex(FIAT + Cardinal(i) * SizeOf(Pointer), 8) +
+          ' -> ' + IntToHex(UIntPtr(a^), 8) + ' unresolvable');
 
     Inc(a);
   end;
+
+  // =========================================================
+  // PASS 2: For each zero-delimited group, vote on best module
+  //         and pin every slot to a candidate from that module
+  // =========================================================
+  ModuleVotes := TDictionary<string, Integer>.Create;
+  Thunks := TObjectList<TImportThunk>.Create;
+
+  i := 0;
+  while i < SlotCount do
+  begin
+    // Skip zero separators (they just end the current thunk naturally)
+    if Slots[i].IsZero then
+    begin
+      Inc(i);
+      Continue;
+    end;
+
+    // Find contiguous non-zero run = one raw group
+    GroupStart := i;
+    GroupEnd := i;
+    while (GroupEnd + 1 < SlotCount) and not Slots[GroupEnd + 1].IsZero do
+      Inc(GroupEnd);
+
+    // Vote: for each slot in group, each candidate casts one vote for its module
+    ModuleVotes.Clear;
+    for j := GroupStart to GroupEnd do
+    begin
+      //Log(ltInfo, Format('Slot %d (%p)', [j, PByte(IAT) + j * SizeOf(Pointer)]));
+      for k := 0 to Slots[j].Candidates.Count - 1 do
+      begin
+        ModuleName := Slots[j].Candidates[k].Module.Name;
+        //Log(ltInfo, Format(' - Candidate %s %p', [ModuleName, Slots[j].Candidates[k].ActualPtr]));
+        if not ModuleVotes.TryGetValue(ModuleName, WinnerVotes) then
+          ModuleVotes.Add(ModuleName, 1)
+        else
+          ModuleVotes[ModuleName] := WinnerVotes + 1;
+      end;
+    end;
+
+    // Find the module with the most votes; apply scoring in ambiguous cases
+    WinnerName := '';
+    WinnerVotes := -1;
+    WinnerRM := nil;
+    for ModuleName in ModuleVotes.Keys do
+    begin
+      if (ModuleVotes[ModuleName] > WinnerVotes) or
+         ((ModuleVotes[ModuleName] = WinnerVotes) and
+          (PreferenceScore(ModuleName) > PreferenceScore(WinnerName))) then
+      begin
+        WinnerVotes := ModuleVotes[ModuleName];
+        WinnerName := ModuleName;
+      end;
+    end;
+
+    // Pin each slot to the winning module's candidate
+    // Build sub-thunks within the group where we CAN resolve to winner;
+    // slots that have no candidate for winner are logged as bogus.
+    for j := GroupStart to GroupEnd do
+    begin
+      Found := False;
+      for k := 0 to Slots[j].Candidates.Count - 1 do
+        if Slots[j].Candidates[k].Module.Name = WinnerName then
+        begin
+          Slots[j].ChosenCandidate := k;
+          if WinnerRM = nil then
+            WinnerRM := Slots[j].Candidates[k].Module;
+          Found := True;
+          Break;
+        end;
+      if (not Found) and (WinnerName <> '') then
+        Log(ltFatal, 'IAT slot ' + IntToHex(FIAT + Cardinal(j) * SizeOf(Pointer), 8) +
+            ' has no candidate for winning module ' + WinnerName + ' (bogus entry)');
+    end;
+
+    // Now walk the group and build thunks, respecting the chosen candidates.
+    // Within a zero-free group we stay in one thunk for the winner module.
+    Thunk := nil;
+    for j := GroupStart to GroupEnd do
+    begin
+      if Slots[j].ChosenCandidate < 0 then Continue; // bogus, skip
+
+      if Thunk = nil then
+      begin
+        Thunk := TImportThunk.Create(WinnerRM);
+        Thunk.Name := WinnerName;
+        Thunks.Add(Thunk);
+      end;
+
+      // Write the resolved pointer back into the IAT image
+      Cand := Slots[j].Candidates[Slots[j].ChosenCandidate];
+      PPointer(PByte(IAT) + j * SizeOf(Pointer))^ := Cand.Address;
+      Thunk.Addresses.Add(PPointer(PByte(IAT) + j * SizeOf(Pointer)));
+    end;
+
+    i := GroupEnd + 1;
+  end;
+  ModuleVotes.Free;
 
   ImportSect := PE.CreateSection('.import', $1000);
 
@@ -451,6 +518,7 @@ end;
 procedure TDumper.GatherModuleExportsFromRemoteProcess(M: PRemoteModule);
 var
   Head: PByte;
+  ExpDataDir: TImageDataDirectory;
   Exp: PImageExportDirectory;
   Off: PByte;
   a, n: PCardinal;
@@ -458,17 +526,21 @@ var
   i: Integer;
   Named: array of Boolean;
   FuncIndex: Cardinal;
+  Fwd: PAnsiChar;
 begin
-  M.ExportTbl := TExportTable.Create;
   GetMem(Head, $1000);
-  RPM(NativeUInt(M.Base), Head, $1000);
-  with PImageNtHeaders(Head + PImageDosHeader(Head)._lfanew).OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT] do
-  begin
-    GetMem(Exp, Size);
-    RPM(NativeUInt(M.Base + VirtualAddress), Exp, Size);
-    Off := PByte(Exp) - VirtualAddress;
+  try
+    RPM(NativeUInt(M.Base), Head, $1000);
+    ExpDataDir := PImageNtHeaders(Head + PImageDosHeader(Head)._lfanew).OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (ExpDataDir.VirtualAddress = 0) or (ExpDataDir.Size < SizeOf(TImageExportDirectory)) then
+      Exit;
+
+    GetMem(Exp, ExpDataDir.Size);
+    RPM(NativeUInt(M.Base + ExpDataDir.VirtualAddress), Exp, ExpDataDir.Size);
+    Off := PByte(Exp) - ExpDataDir.VirtualAddress;
+  finally
+    FreeMem(Head);
   end;
-  FreeMem(Head);
 
   Pointer(a) := Off + Exp.AddressOfFunctions;
   Pointer(n) := Off + Exp.AddressOfNames;
@@ -485,37 +557,125 @@ begin
   end;
   for i := 0 to Exp.NumberOfFunctions - 1 do
   begin
+    // Add ordinals
     if not Named[i] then
     begin
       FuncIndex := Exp.Base + UInt32(i);
       M.ExportTbl.AddOrSetValue(M.Base + a[i], '#' + IntToStr(FuncIndex));
+    end;
+
+    // Check if entry is forward
+    if (a[i] > ExpDataDir.VirtualAddress) and (a[i] < ExpDataDir.VirtualAddress + ExpDataDir.Size) then
+    begin
+      Fwd := PAnsiChar(Off + a[i]); // e.g. 'NTDLL.RtlAllocateHeap'
+      if Pos(AnsiString('.#'), Fwd) = 0 then
+      begin
+        M.Forwards.Add(TForward.Create(string(AnsiString(Fwd)), M.Base + a[i]));
+      end;
     end;
   end;
 
   FreeMem(Exp);
 end;
 
-function TDumper.GetLocalProcAddr(hModule: HMODULE; ProcName: PAnsiChar): Pointer;
+{$IFDEF CPUX86}
+procedure TDumper.CollectSpecialUser32Forwards(User32RM: PRemoteModule);
 var
-  Exp: PImageExportDirectory;
-  Off: PByte;
-  a, n: PCardinal;
-  o: PWord;
+  ModScan: PByte;
+  ExpDataDir: TImageDataDirectory;
+  ExpDir: PImageExportDirectory;
   i: Integer;
+  a: PCardinal;
+  Fwd: PAnsiChar;
 begin
-  with PImageNtHeaders(hModule + Cardinal(PImageDosHeader(hModule)._lfanew)).OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT] do
+  // Scan specially loaded user32 copy, because forwards are patched out in normally loaded user32 images.
+  ModScan := Pointer(FHUsr);
+  ExpDataDir := PImageNTHeaders(ModScan + PImageDosHeader(ModScan)._lfanew).OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+  ExpDir := Pointer(ModScan + ExpDataDir.VirtualAddress);
+
+  a := PCardinal(ModScan + ExpDir.AddressOfFunctions);
+  for i := 0 to ExpDir.NumberOfFunctions - 1 do
   begin
-    Exp := Pointer(hModule + VirtualAddress);
-    Off := PByte(Exp) - VirtualAddress;
+    Fwd := PAnsiChar(ModScan + a^);
+    if (PByte(Fwd) > ModScan + ExpDataDir.VirtualAddress) and (PByte(Fwd) < ModScan + ExpDataDir.VirtualAddress + ExpDataDir.Size) and (Pos(AnsiString('.#'), Fwd) = 0) then
+    begin
+      User32RM.Forwards.Add(TForward.Create(string(AnsiString(Fwd)), nil));
+    end;
+    Inc(a);
   end;
+end;
+{$ENDIF}
 
-  Pointer(a) := Off + Exp.AddressOfFunctions;
-  Pointer(n) := Off + Exp.AddressOfNames;
-  Pointer(o) := Off + Exp.AddressOfNameOrdinals;
-  for i := 0 to Exp.NumberOfNames - 1 do
-    if AnsiStrComp(PAnsiChar(Off + n[i]), ProcName) = 0 then
-      Exit(Pointer(hModule + a[o[i]]));
+procedure TDumper.ResolveForwards(M: PRemoteModule);
+var
+  Fwd: TForward;
+  DotPos: Integer;
+  ForwardModName, ForwardAPIName: string;
+  ForwardMod: PRemoteModule;
+  APISetResolved: HMODULE;
+  Exprt: TPair<Pointer, string>;
+  ProcAddr, FwdValue: Pointer;
+begin
+  for Fwd in M.Forwards do
+  begin
+    //Log(ltInfo, M.Name + ' --> ' + Fwd.Key);
 
+    DotPos := Pos('.', Fwd.Key);
+    ForwardModName := Copy(Fwd.Key, 1, DotPos - 1);
+    if Pos('-ms-win-', ForwardModName) = 4 then // api-ms-win, ext-ms-win
+    begin
+      // Take a shortcut by resolving this locally.
+      APISetResolved := GetModuleHandle(PChar(ForwardModName));
+      if APISetResolved <> 0 then
+        ForwardMod := GetRemoteModule(APISetResolved)
+      else
+        ForwardMod := nil;
+    end
+    else
+      ForwardMod := GetRemoteModule(ForwardModName + '.dll');
+
+    if ForwardMod <> nil then
+    begin
+      ForwardAPIName := Copy(Fwd.Key, DotPos + 1, 50);
+      ProcAddr := nil;
+      for Exprt in ForwardMod.ExportTbl do
+        if Exprt.Value = ForwardAPIName then
+        begin
+          ProcAddr := Exprt.Key;
+          Break;
+        end;
+
+      if ProcAddr <> nil then
+      begin
+        if not FForwards.ContainsKey(ProcAddr) then
+          FForwards.Add(ProcAddr, TList<TForwardOrigin>.Create);
+        FwdValue := Fwd.Value;
+        {$IFDEF CPUX86}
+        if M.Name = 'user32.dll' then
+          FwdValue := ProcAddr; // user32 ExportTbl has the patched (resolved) values
+        {$ENDIF}
+        FForwards[ProcAddr].Add(TForwardOrigin.Create(M, FwdValue));
+      end;
+      //Log(ltInfo, Format('%s @ %p', [ForwardAPIName, ProcAddr]));
+    end
+    //else
+    //  Log(ltFatal, Format('Forward target not loaded: %s', [ForwardModName]));
+  end;
+end;
+
+function TDumper.GetRemoteModule(Base: HMODULE): PRemoteModule;
+begin
+  for Result in FAllModules do
+    if HMODULE(Result.Base) = Base then
+      Exit;
+  Result := nil;
+end;
+
+function TDumper.GetRemoteModule(const Name: string): PRemoteModule;
+begin
+  for Result in FAllModules do
+    if Result.Name = LowerCase(Name) then
+      Exit;
   Result := nil;
 end;
 
@@ -528,12 +688,7 @@ begin
 
   for RM in FAllModules do
     if (Address >= NativeUInt(RM.Base)) and (Address < NativeUInt(RM.EndOff)) then
-    begin
-      if RM.ExportTbl = nil then
-        GatherModuleExportsFromRemoteProcess(RM);
-
       Exit(RM.ExportTbl.ContainsKey(Pointer(Address)));
-    end;
 
   Result := False;
 end;
@@ -557,21 +712,20 @@ begin
       RM.Base := ME.modBaseAddr;
       RM.EndOff := ME.modBaseAddr + ME.modBaseSize;
       RM.Name := LowerCase(ME.szModule);
-      RM.ExportTbl := nil;
+      RM.ExportTbl := TExportTable.Create;
+      RM.Forwards := TList<TForward>.Create;
+      GatherModuleExportsFromRemoteProcess(RM);
+      {$IFDEF CPUX86}
+      if (RM.Name = 'user32.dll') and (FHUsr <> 0) then
+        CollectSpecialUser32Forwards(RM);
+      {$ENDIF}
       FAllModules.Add(RM);
     end;
   until not Module32Next(hSnap, ME);
   CloseHandle(hSnap);
-end;
 
-function TDumper.TargetHasModule(const Name: string): Boolean;
-var
-  RM: PRemoteModule;
-begin
   for RM in FAllModules do
-    if RM.Name = Name then
-      Exit(True);
-  Result := False;
+    ResolveForwards(RM);
 end;
 
 function TDumper.RPM(Address: NativeUInt; Buf: Pointer; BufSize: NativeUInt): Boolean;
@@ -705,6 +859,22 @@ begin
   Addresses.Free;
 
   inherited;
+end;
+
+{ TForward }
+
+constructor TForward.Create(const AKey: string; AValue: Pointer);
+begin
+  Key := AKey;
+  Value := AValue;
+end;
+
+{ TForwardOrigin }
+
+constructor TForwardOrigin.Create(ASourceModule: PRemoteModule; ASourceAddress: Pointer);
+begin
+  SourceModule := ASourceModule;
+  SourceAddress := ASourceAddress;
 end;
 
 end.
