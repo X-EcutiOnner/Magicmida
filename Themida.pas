@@ -53,6 +53,7 @@ type
     function ProcessGuardedAccess(hThread: THandle; const ExcRecord: TExceptionRecord): Cardinal;
 
     procedure RestoreStolenOEPForMSVC6(hThread: THandle; var OEP: NativeUInt);
+    procedure RestoreStolenOEPForMSVC9DLL(hThread: THandle; var OEP: NativeUInt);
     function TryFindCorrectOEP(OEP: NativeUInt): NativeUInt;
     function IsTMExceptionHandler(Address: NativeUInt): Boolean;
     procedure FixupAPICallSites(IAT: NativeUInt);
@@ -1077,6 +1078,8 @@ OEPReached:
     Log(ltGood, 'OEP: ' + IntToHex(OEP, 8));
 
     RestoreStolenOEPForMSVC6(hThread, OEP);
+    if FIsDLL and (FMajorLinkerVersion = 9) then
+      RestoreStolenOEPForMSVC9DLL(hThread, OEP);
     CheckVirtualizedOEP(OEP);
 
     if not AncientVer then
@@ -1313,6 +1316,29 @@ begin
   PCardinal(@RestoreBuf[11])^ := StackData[0];
 
   WriteProcessMemory(FProcess.hProcess, Pointer(OEP), @RestoreBuf, Length(RestoreBuf), NumWritten);
+
+  Log(ltGood, 'Correct OEP: ' + IntToHex(OEP, 8));
+end;
+
+procedure TTMDebugger.RestoreStolenOEPForMSVC9DLL(hThread: THandle; var OEP: NativeUInt);
+const
+  RESTORE_DATA: array[0..10] of Byte = ($8B, $FF, $55, $8B, $EC, $83, $7D, $0C, $01, $75, $05);
+var
+  CheckByte: Byte;
+  NumWritten: NativeUInt;
+begin
+  RPM(OEP, @CheckByte, 1);
+  if CheckByte <> $E8 then
+    Exit;
+
+  RPM(OEP - Cardinal(Length(RESTORE_DATA)), @CheckByte, 1);
+  if CheckByte <> $E9 then  // jmp to vm
+    Exit;
+
+  Log(ltInfo, 'Stolen MSVC9 DLL OEP detected.');
+
+  Dec(OEP, Length(RESTORE_DATA));
+  WriteProcessMemory(FProcess.hProcess, Pointer(OEP), @RESTORE_DATA, Length(RESTORE_DATA), NumWritten);
 
   Log(ltGood, 'Correct OEP: ' + IntToHex(OEP, 8));
 end;
