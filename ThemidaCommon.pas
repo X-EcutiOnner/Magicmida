@@ -107,6 +107,18 @@ begin
   Result := 0;
 end;
 
+function FindGoBuildIdEnd(CodeDump: PByte; CodeSize: Cardinal): Cardinal;
+var
+  i: Cardinal;
+begin
+  // Go has "Go build ID" at the start of .text.
+  for i := 0 to CodeSize - 2 do
+    if PWord(CodeDump + i)^ = $FF20 then // 20 FF marks the end
+      Exit(i + 2);
+
+  Result := 0;
+end;
+
 function TTMCommon.DetermineIATAddress(OEP: NativeUInt; Dumper: TDumper): NativeUInt;
 var
   TextBase, CodeSize, DataSize: NativeUInt;
@@ -152,6 +164,50 @@ var
 
       if ((PByte(Dis.EIP)^ = $C3) or (PByte(Dis.EIP)^ = $C2)) and not IgnoreMethodBoundary then // ret
         Exit(0);
+
+      Inc(NumInstr);
+      if Len > 0 then
+      begin
+        Inc(Dis.EIP, Len);
+        Inc(Dis.VirtualAddr, Len);
+      end
+      else // better luck next time...
+      begin
+        Inc(Dis.EIP, 1);
+        Inc(Dis.VirtualAddr, 1);
+      end;
+    end;
+  end;
+
+  function FindGoAPICall(Address: NativeUInt): NativeUInt;
+  var
+    Dis: TDisasm;
+    Len: Integer;
+    IATPointer, ThePointer: NativeUInt;
+  begin
+    Result := 0;
+    FillChar(Dis, SizeOf(Dis), 0);
+    Dis.EIP := NativeUInt(CodeDump) + Address - TextBase;
+    Dis.VirtualAddr := Address;
+    while Address < TextBase + CodeSize do
+    begin
+      Len := DisasmCheck(Dis);
+
+      // mov rax, [addr]
+      // mov [rsp], rax
+      {$IFDEF CPUX64}
+      if (Len = 7) and (Dis.Instruction.Opcode = $8B) and (PCardinal(Dis.EIP + 7)^ = $24048948) then
+      {$ELSE}
+      if (Len = 6) and (Dis.Instruction.Opcode = $8B) and (PCardinal(Dis.EIP + 6)^ and $00FFFFFF = $00240489) then
+      {$ENDIF}
+      begin
+        IATPointer := Dis.Operand2.Memory.Displacement;
+        {$IFDEF CPUX64}
+        Inc(IATPointer, Dis.VirtualAddr + 7);  // RIP-relative
+        {$ENDIF}
+        if RPM(IATPointer, @ThePointer, SizeOf(ThePointer)) and Dumper.IsAPIAddress(ThePointer) then
+          Exit(IATPointer);
+      end;
 
       Inc(NumInstr);
       if Len > 0 then
@@ -231,13 +287,14 @@ begin
   DataSize := FPESections[DataSectionIndex].Misc.VirtualSize - (FBaseOfData - FPESections[DataSectionIndex].VirtualAddress);
   Log(ltInfo, Format('Text base: 0x%.8X, code size: 0x%X, data size: 0x%X', [TextBase, CodeSize, DataSize]));
   NumInstr := 0;
-  IATRef := 0;
   GetMem(CodeDump, CodeSize);
   try
     if not RPM(TextBase, CodeDump, CodeSize) then
       raise Exception.Create('DetermineIATAddress: RPM failed');
 
-    if not FIsVMOEP then
+    if PCardinal(@CodeDump[0])^ = $6F4720FF then
+      IATRef := FindGoAPICall(TextBase + FindGoBuildIdEnd(CodeDump, CodeSize))
+    else if not FIsVMOEP then
       IATRef := FindCallOrJmpPtr(OEP)
     else if (PCardinal(@CodeDump[{$IFDEF CPUX86}6{$ELSE}10{$ENDIF}])^ = $6C6F6F42) or (PCardinal(@CodeDump[6])^ = $65747942) then
       IATRef := FindCallOrJmpPtr(TextBase + FindDelphiCall(CodeDump, CodeSize), True)
