@@ -29,7 +29,8 @@ uses
   Tracer in 'Tracer.pas',
   AntiDumpFix in 'AntiDumpFix.pas',
   DebuggerCore in 'DebuggerCore.pas',
-  ThemidaCommon in 'ThemidaCommon.pas';
+  ThemidaCommon in 'ThemidaCommon.pas',
+  OneCoreUAP in 'OneCoreUAP.pas';
 
 {$R *.res}
 

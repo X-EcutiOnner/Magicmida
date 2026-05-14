@@ -158,6 +158,7 @@
         <DCCReference Include="AntiDumpFix.pas"/>
         <DCCReference Include="DebuggerCore.pas"/>
         <DCCReference Include="ThemidaCommon.pas"/>
+        <DCCReference Include="OneCoreUAP.pas"/>
         <BuildConfiguration Include="Base">
             <Key>Base</Key>
         </BuildConfiguration>

@@ -45,6 +45,11 @@ type
     destructor Destroy; override;
   end;
 
+  TOriginalImport = record
+    DLLName: string;
+    FuncName: string;
+  end;
+
   TDumper = class
   private
     FProcess: TProcessInformation;
@@ -53,6 +58,7 @@ type
     FAllModules: TList<PRemoteModule>;
     FIATImage: PByte;
     FIATImageSize: Cardinal;
+    FOriginalImports: TList<TOriginalImport>;
 
     {$IFDEF CPUX86}
     FUsrPath: string;
@@ -68,8 +74,10 @@ type
     function GetRemoteModule(Base: HMODULE): PRemoteModule; overload;
     function RPM(Address: NativeUInt; Buf: Pointer; BufSize: NativeUInt): Boolean;
     procedure MakeMemoryReadable(Base, Size: NativeUInt);
+    function GetOriginalImports(const FileName: string): TList<TOriginalImport>;
+    function HasOriginalImport(const DLL, Func: string): Boolean;
   public
-    constructor Create(const AProcess: TProcessInformation; AImageBase, AOEP: UIntPtr);
+    constructor Create(const AProcess: TProcessInformation; const AOriginalFile: string; AImageBase, AOEP: UIntPtr);
     destructor Destroy; override;
 
     function Process: TPEHeader;
@@ -94,6 +102,8 @@ type
   end;
 
 implementation
+
+uses OneCoreUAP;
 
 const
   ForwardPreferences: array[0..8] of string = (
@@ -120,7 +130,7 @@ end;
 
 { TDumper }
 
-constructor TDumper.Create(const AProcess: TProcessInformation; AImageBase, AOEP: UIntPtr);
+constructor TDumper.Create(const AProcess: TProcessInformation; const AOriginalFile: string; AImageBase, AOEP: UIntPtr);
 begin
   FProcess := AProcess;
   FOEP := AOEP;
@@ -137,6 +147,7 @@ begin
   {$ENDIF}
 
   FForwards := TForwardMap.Create([doOwnsValues], 512);
+  FOriginalImports := GetOriginalImports(AOriginalFile);
 end;
 
 destructor TDumper.Destroy;
@@ -144,6 +155,7 @@ var
   RM: PRemoteModule;
 begin
   FForwards.Free;
+  FOriginalImports.Free;
 
   if FAllModules <> nil then
   begin
@@ -259,16 +271,15 @@ var
   IATSize, Diff: Cardinal;
   PE: TPEHeader;
   a: ^PByte;
-  Fwd: Pointer;
   Thunks: TList<TImportThunk>;
   Thunk: TImportThunk;
-  Found: Boolean;
   RM: PRemoteModule;
   s: AnsiString;
   OrdIndex: Cardinal;
   Section, Strs: PByte;
   Descriptors: PImageImportDescriptor;
   ImportSect: PPESection;
+  AllowApiSets: Boolean;
 
   // --- Pass 1 data ---
   Slots: array of TIATSlot;
@@ -280,9 +291,10 @@ var
   // --- Pass 2 data ---
   GroupStart, GroupEnd: Integer;
   ModuleVotes: TDictionary<string, Integer>;
-  ModuleName, WinnerName: string;
+  ModuleName, WinnerName, FuncName, ApiSetName: string;
   WinnerVotes: Integer;
   WinnerRM: PRemoteModule;
+  FuncAddr: Pointer;
 begin
   if FIAT = 0 then
     raise Exception.Create('Must set IAT before calling Process()');
@@ -308,6 +320,14 @@ begin
 
   if FAllModules = nil then
     TakeModuleSnapshot;
+
+  AllowApiSets := False;
+  for i := 0 to FOriginalImports.Count - 1 do
+    if Pos('api-ms-win', FOriginalImports[i].DLLName) = 1 then
+    begin
+      AllowApiSets := True;
+      Break;
+    end;
 
   SlotCount := IATSize div SizeOf(Pointer);
   SetLength(Slots, SlotCount);
@@ -389,7 +409,7 @@ begin
       for k := 0 to Slots[j].Candidates.Count - 1 do
       begin
         ModuleName := Slots[j].Candidates[k].Module.Name;
-        //Log(ltInfo, Format(' - Candidate %s %p', [ModuleName, Slots[j].Candidates[k].ActualPtr]));
+        //Log(ltInfo, Format(' - Candidate %s %p', [ModuleName, Slots[j].Candidates[k].Address]));
         if not ModuleVotes.TryGetValue(ModuleName, WinnerVotes) then
           ModuleVotes.Add(ModuleName, 1)
         else
@@ -413,31 +433,68 @@ begin
     end;
 
     // Pin each slot to the winning module's candidate
-    // Build sub-thunks within the group where we CAN resolve to winner;
-    // slots that have no candidate for winner are logged as bogus.
     for j := GroupStart to GroupEnd do
     begin
-      Found := False;
       for k := 0 to Slots[j].Candidates.Count - 1 do
         if Slots[j].Candidates[k].Module.Name = WinnerName then
         begin
           Slots[j].ChosenCandidate := k;
           if WinnerRM = nil then
             WinnerRM := Slots[j].Candidates[k].Module;
-          Found := True;
           Break;
         end;
-      if (not Found) and (WinnerName <> '') then
-        Log(ltFatal, 'IAT slot ' + IntToHex(FIAT + Cardinal(j) * SizeOf(Pointer), 8) +
-            ' has no candidate for winning module ' + WinnerName + ' (bogus entry)');
     end;
+
+    ApiSetName := '';
+    if AllowApiSets then
+      for j := GroupStart to GroupEnd do
+      begin
+        if (Slots[j].ChosenCandidate < 0) and (Slots[j].Candidates.Count = 0) then
+          Continue;
+
+        // If it had no candidate for WinnerRM, see if we can map it into the same apiset
+        if Slots[j].ChosenCandidate < 0 then
+          FuncName := Slots[j].Candidates[0].Module.ExportTbl[Slots[j].Candidates[0].Address]
+        else
+          FuncName := WinnerRM.ExportTbl[Slots[j].Candidates[Slots[j].ChosenCandidate].Address];
+
+        if Pos('RtlQueryPerformance', FuncName) = 1 then
+          Delete(FuncName, 1, 3); // Hack for api-ms-win-core-profile-l1-1-0.dll
+
+        if j = GroupStart then
+          ApiSetName := GetOneCoreUAPModuleByAPI(FuncName)
+        else if (ApiSetName <> '') and (GetOneCoreUAPModuleByAPI(FuncName) <> ApiSetName) then
+          ApiSetName := '';
+      end;
+
+    // If using an ApiSet, remap so the slot is not skipped as bogus. Looking for the same name
+    // in WinnerRM is a bit risky, but so far this has happened between kernel32 and kernelbase.
+    if ApiSetName <> '' then
+      for j := GroupStart to GroupEnd do
+        if Slots[j].ChosenCandidate < 0 then
+        begin
+          FuncName := Slots[j].Candidates[0].Module.ExportTbl[Slots[j].Candidates[0].Address];
+          // Find the address of this function in WinnerRM's export table
+          for FuncAddr in WinnerRM.ExportTbl.Keys do
+            if WinnerRM.ExportTbl[FuncAddr] = FuncName then
+            begin
+              Slots[j].Candidates.{$IFNDEF FPC}PList^{$ELSE}List{$ENDIF}[0].Address := FuncAddr;
+              Slots[j].ChosenCandidate := 0;
+              Log(ltInfo, Format('IAT slot %X: remapped apiset member %s', [FIAT + Cardinal(j) * SizeOf(Pointer), FuncName]));
+              Break;
+            end;
+        end;
 
     // Now walk the group and build thunks, respecting the chosen candidates.
     // Within a zero-free group we stay in one thunk for the winner module.
     Thunk := nil;
     for j := GroupStart to GroupEnd do
     begin
-      if Slots[j].ChosenCandidate < 0 then Continue; // bogus, skip
+      if Slots[j].ChosenCandidate < 0 then
+      begin
+        Log(ltFatal, Format('IAT slot %X  has no candidate for winning module %s (bogus entry)', [FIAT + Cardinal(j) * SizeOf(Pointer), WinnerName]));
+        Continue;
+      end;
 
       if Thunk = nil then
       begin
@@ -450,6 +507,11 @@ begin
       Cand := Slots[j].Candidates[Slots[j].ChosenCandidate];
       PPointer(PByte(IAT) + j * SizeOf(Pointer))^ := Cand.Address;
       Thunk.Addresses.Add(PPointer(PByte(IAT) + j * SizeOf(Pointer)));
+    end;
+    if (ApiSetName <> '') and not HasOriginalImport(Thunk.Name, WinnerRM.ExportTbl[PPointer(PByte(IAT) + GroupStart * SizeOf(Pointer))^]) then
+    begin
+      Log(ltInfo, Format('OneCoreUAP: Using %s instead of %s', [ApiSetName, WinnerName]));
+      Thunk.Name := ApiSetName;
     end;
 
     i := GroupEnd + 1;
@@ -482,6 +544,8 @@ begin
         Thunk.Addresses[j]^ := Pointer(IMAGE_ORDINAL_FLAG or OrdIndex);
         Continue;
       end;
+      if (Pos(AnsiString('RtlQueryPerformance'), s) = 1) and (Pos('api-ms-win', Thunk.Name) = 1) then
+        Delete(s, 1, 3);
 
       Inc(Strs, 2); // Hint
       // Set the address in the IAT to this string entry
@@ -499,7 +563,6 @@ begin
         FillChar((Section + ImportSect.Header.SizeOfRawData - $1000)^, $1000, 0);
         Strs := Section + Diff;
         Pointer(Descriptors) := Section;
-        //Log(ltInfo, 'Increased import section size to ' + IntToHex(ImportSect.Header.SizeOfRawData, 4));
       end;
     end;
   end;
@@ -815,6 +878,84 @@ begin
   finally
     FreeMem(RsrcData);
   end;
+end;
+
+function TDumper.GetOriginalImports(const FileName: string): TList<TOriginalImport>;
+var
+  FS: TFileStream;
+  HeaderBuf, SectBuf: PByte;
+  FilePE: TPEHeader;
+  ImportDir: TImageDataDirectory;
+  Sect: PPESection;
+  Descriptor: PImageImportDescriptor;
+  ThunkAddr: PNativeUInt;
+  Thunk: NativeUInt;
+  DllName: AnsiString;
+  Import: TOriginalImport;
+begin
+  Result := nil;
+
+  FS := TFileStream.Create(FileName, fmOpenRead or fmShareDenyNone);
+  GetMem(HeaderBuf, $1000);
+  try
+    FS.ReadBuffer(HeaderBuf^, $1000);
+    FilePE := TPEHeader.Create(HeaderBuf);
+    try
+      ImportDir := FilePE.NTHeaders.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+      if (ImportDir.VirtualAddress = 0) or (ImportDir.Size = 0) then
+        Exit;
+
+      Sect := FilePE.GetSectionByVA(ImportDir.VirtualAddress);
+      if Sect = nil then
+        Exit;
+
+      GetMem(SectBuf, Sect.Header.SizeOfRawData);
+      try
+        FS.Position := Sect.Header.PointerToRawData;
+        FS.ReadBuffer(SectBuf^, Sect.Header.SizeOfRawData);
+
+        Result := TList<TOriginalImport>.Create;
+        Descriptor := PImageImportDescriptor(SectBuf + (ImportDir.VirtualAddress - Sect.Header.VirtualAddress));
+
+        while Descriptor.Name <> 0 do
+        begin
+          DllName := AnsiString(PAnsiChar(SectBuf + (Descriptor.Name - Sect.Header.VirtualAddress)));
+
+          ThunkAddr := PNativeUInt(SectBuf + (Descriptor.FirstThunk - Sect.Header.VirtualAddress));
+          while ThunkAddr^ <> 0 do
+          begin
+            Import.DLLName := LowerCase(string(DllName));
+            Thunk := ThunkAddr^;
+            if (Thunk and IMAGE_ORDINAL_FLAG) <> 0 then
+              Import.FuncName := '#' + IntToStr(Thunk and $FFFF)
+            else
+              Import.FuncName := string(AnsiString(PAnsiChar(SectBuf + (Thunk - Sect.Header.VirtualAddress) + 2)));
+            Result.Add(Import);
+            Inc(ThunkAddr);
+          end;
+
+          Inc(Descriptor);
+        end;
+      finally
+        FreeMem(SectBuf);
+      end;
+    finally
+      FilePE.Free;
+    end;
+  finally
+    FreeMem(HeaderBuf);
+    FS.Free;
+  end;
+end;
+
+function TDumper.HasOriginalImport(const DLL, Func: string): Boolean;
+var
+  OI: TOriginalImport;
+begin
+  for OI in FOriginalImports do
+    if (OI.DLLName = DLL) and (OI.FuncName = Func) then
+      Exit(True);
+  Result := False;
 end;
 
 { TDumperDotnet }

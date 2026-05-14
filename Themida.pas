@@ -1124,7 +1124,7 @@ begin
       Break;
   end;
 
-  Dumper := TDumper.Create(FProcess, FImageBase, OEP);
+  Dumper := TDumper.Create(FProcess, FExecutable, FImageBase, OEP);
 
   // Look for IAT by analyzing code near OEP
   IAT := DetermineIATAddress(OEP, Dumper);
